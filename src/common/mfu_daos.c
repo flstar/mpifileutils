@@ -14,6 +14,7 @@
 #include <daos_uns.h>
 #include <gurt/common.h>
 #include <gurt/hash.h>
+#include <libgen.h>
 
 #ifdef HDF5_SUPPORT
 #include <hdf5.h>
@@ -293,10 +294,37 @@ int daos_parse_path(
 {
     struct duns_attr_t  dattr = {0};
     int                 rc;
+    char*               tmp_path1 = NULL;
+    char*               path_dirname = NULL;
+    char*               tmp_path2 = NULL;
+    char*               path_basename = NULL;
+    char*               tmp = NULL;
+
+    /* call duns_resolve_path on dirname. If basename does not
+     * exist then duns_resolve_path will fail even if dirname is a 
+     * UNS path */
+
+    /* get dirname */
+    tmp_path1 = strdup(path);
+    path_dirname = dirname(tmp_path1);
 
     /* Check if this path represents a daos pool and/or container. */
-    rc = duns_resolve_path(path, &dattr);
+    rc = duns_resolve_path(path_dirname, &dattr);
     if (rc == 0) {
+        /* if duns_resolve_path succeeds then concat basename to 
+         * da_rel_path */
+        tmp_path2 = strdup(path);
+        path_basename = basename(tmp_path2);
+        
+        /* make sure there is enough memory allocated to concat basename */
+        tmp = realloc(dattr.da_rel_path, path_len);
+        if (tmp == NULL) {
+            rc = ENOMEM;
+        }
+        dattr.da_rel_path = tmp;
+        strcat(dattr.da_rel_path, "/");
+        strcat(dattr.da_rel_path, path_basename);
+
         /* daos:// or UNS path */
         uuid_copy(*p_uuid, dattr.da_puuid);
         uuid_copy(*c_uuid, dattr.da_cuuid);
@@ -314,8 +342,9 @@ int daos_parse_path(
         rc = 1;
     }
 
+    mfu_free(&tmp_path1);
+    mfu_free(&tmp_path2);
     mfu_free(&dattr.da_rel_path);
-
     return rc;
 }
 
