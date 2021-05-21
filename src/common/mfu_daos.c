@@ -319,7 +319,7 @@ int daos_parse_path(
         /* make sure there is enough memory allocated to concat basename */
         tmp = realloc(dattr.da_rel_path, path_len);
         if (tmp == NULL) {
-            rc = ENOMEM;
+            return -ENOMEM;
         }
         dattr.da_rel_path = tmp;
         strcat(dattr.da_rel_path, "/");
