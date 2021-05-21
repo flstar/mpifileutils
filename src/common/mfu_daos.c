@@ -298,7 +298,6 @@ int daos_parse_path(
     char*               path_dirname = NULL;
     char*               tmp_path2 = NULL;
     char*               path_basename = NULL;
-    char*               tmp = NULL;
 
     /* call duns_resolve_path on dirname. If basename does not
      * exist then duns_resolve_path will fail even if dirname is a 
@@ -316,22 +315,15 @@ int daos_parse_path(
         tmp_path2 = strdup(path);
         path_basename = basename(tmp_path2);
         
-        /* make sure there is enough memory allocated to concat basename */
-        tmp = realloc(dattr.da_rel_path, path_len);
-        if (tmp == NULL) {
-            return -ENOMEM;
-        }
-        dattr.da_rel_path = tmp;
-        strcat(dattr.da_rel_path, "/");
-        strcat(dattr.da_rel_path, path_basename);
-
         /* daos:// or UNS path */
         uuid_copy(*p_uuid, dattr.da_puuid);
         uuid_copy(*c_uuid, dattr.da_cuuid);
-        if (dattr.da_rel_path == NULL) {
+
+        if (strcmp(path_basename, "/") != 0) {
             strncpy(path, "/", path_len);
+            strcat(path, path_basename);
         } else {
-            strncpy(path, dattr.da_rel_path, path_len);
+            strncpy(path, path_basename, path_len);
         }
     } else if (strncmp(path, "daos:", 5) == 0) {
         /* Actual error, since we expect a daos path */
