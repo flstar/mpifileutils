@@ -8,6 +8,9 @@
 #include <errno.h>
 #include <string.h>
 #include <pthread.h>
+#include <sys/mman.h>
+#include <openssl/md5.h>
+#include <openssl/evp.h>
 
 #include "s3client.h"
 #include "mfu.h"
@@ -130,6 +133,7 @@ s3client_t * s3client_new(
 
     client->list_max_keys = 1000;
     client->try_times = 3;
+    client->put_times = 3;
 
 out:
     return client;
@@ -425,6 +429,178 @@ int s3client_stat_path(s3client_t *client, const char *key, struct stat *statbuf
     }
     else {
         rc = -from_s3status(cb_data.status);
+    }
+
+    return rc;
+}
+
+int s3client_test_object(s3client_t *client, const char *key, const char *etag)
+{
+    int rc = -from_s3status(S3StatusInternalError), i;
+    common_callback_data_t cb_data;
+    memset(&cb_data, 0x00, sizeof(cb_data));
+    cb_data.status = S3StatusInternalError;
+
+    for (i = 0; i < client->try_times; i++) {
+        S3_head_object(&client->bucketContent, key, NULL, 0, &default_response_handler, &cb_data);
+        if (S3_status_is_retryable(cb_data.status)) {
+            continue;
+        }
+        break;
+    }
+
+    rc = -from_s3status(cb_data.status);
+    if (rc) {
+        goto out;
+    }
+
+    if (etag != NULL && strcmp(etag, cb_data.etag) != 0) {
+        rc = -from_s3status(S3StatusBadIfMatchETag);
+    }
+
+out:
+    return rc;
+}
+
+static int md5_file(int fd, unsigned char *result)
+{
+    int rc = 0;
+    struct stat stat1;
+    char *data = NULL;
+
+    rc = fstat(fd, &stat1);
+    if (rc) {
+        rc = -errno;
+        goto out;
+    }
+
+    data = mmap(0, stat1.st_size, PROT_READ, MAP_SHARED, fd, 0);
+    if (data == NULL) {
+        rc = -errno;
+        goto out;
+    }
+
+    MD5(data, stat1.st_size, result);
+    rc = 0;
+
+out:
+    if (data != NULL) {
+        munmap(data, stat1.st_size);
+    }
+    return rc;
+}
+
+typedef struct {
+    common_callback_data_t common;
+    int fd;
+} put_file_callback_data_t;
+
+static int _put_file_callback(int bufferSize, char *buffer, void *callbackData)
+{
+    put_file_callback_data_t *cb_data = (put_file_callback_data_t *)callbackData;
+    int rc = read(cb_data->fd, buffer, bufferSize);
+
+    return rc;
+}
+
+static int s3client_put_file_once(s3client_t *client, const char *key, const char *fn)
+{
+    int rc = -from_s3status(S3StatusInternalError);
+    int fd = -1;
+    put_file_callback_data_t cb_data;
+    unsigned char md5[MD5_DIGEST_LENGTH];
+    char b64md5[2 * MD5_DIGEST_LENGTH];
+    char etag[MAX_ETAG_SIZE];
+    struct stat stat1;
+
+    memset(&cb_data, 0x00, sizeof(cb_data));
+    cb_data.common.status = S3StatusInternalError;
+
+    // open local file
+    fd = open(fn, O_RDONLY | O_NOATIME);
+    if (fd < 0) {
+        rc = -errno;
+        goto out;
+    }
+    cb_data.fd = fd;
+
+    // calculate md5 checksum, generate base64-md5 and etag
+    rc = md5_file(fd, md5);
+    if (rc != 0) {
+        goto out;
+    }
+
+    EVP_EncodeBlock(b64md5, md5, MD5_DIGEST_LENGTH);
+
+    etag[0] = '"';
+    for (int i = 0; i < MD5_DIGEST_LENGTH; i++) {
+        sprintf(etag + 2 * i + 1, "%02x", (unsigned char)md5[i]);
+    }
+    etag[2 * MD5_DIGEST_LENGTH + 1] = '"';
+    etag[2 * MD5_DIGEST_LENGTH + 2] = '\0';
+
+    memset(&stat1, 0x00, sizeof(stat1));
+    rc = fstat(fd, &stat1);
+    if (rc != 0) {
+        rc = -errno;
+        goto out;
+    }
+
+    S3PutObjectHandler handler = {
+        default_response_handler,
+        &_put_file_callback
+    };
+
+    S3PutProperties props = {NULL, b64md5, NULL, NULL, NULL, -1, 0, 0, NULL, 0};
+
+    RETRY_S3_REQUEST(
+        do {
+            lseek(fd, 0, SEEK_SET);
+            S3_put_object(&client->bucketContent, key, stat1.st_size, &props,
+                          NULL, 0, &handler, &cb_data);
+        } while(0),
+        client->try_times,
+        cb_data.common.status
+    );
+
+    rc = -from_s3status(cb_data.common.status);
+    if (rc != 0) {
+        goto out;
+    }
+
+    rc = s3client_test_object(client, key, etag);
+    if (rc != 0) {
+        MFU_LOG(MFU_LOG_VERBOSE, "failed to check existence of object %s. %d:%s",
+            key, -rc, errno2str(-rc));
+    }
+
+out:
+    if (fd >= 0) {
+        close(fd);
+    }
+    return rc;
+}
+
+int s3client_put_file(s3client_t *client, const char *key, const char *fn)
+{
+    int rc = -from_s3status(S3StatusInternalError);
+
+    for (int i = 0; i < client->put_times; i++) {
+        rc = s3client_put_file_once(client, key, fn);
+        if (rc && (-rc) >= S3STATUS_BASE && i < client->put_times - 1) {
+            int secs = 10 * (i + 1);
+            MFU_LOG(MFU_LOG_VERBOSE, "failed to put object %s, %d:%s. Retry in %d seconds.",
+                key, -rc, errno2str(-rc), secs);
+            sleep(secs);       // 10, 20, totally 30 seconds
+        }
+        else {
+            break;
+        }
+    }
+
+    if (rc) {
+        MFU_LOG(MFU_LOG_ERR, "failed to put object after trying for %d times. %d:%s",
+            client->put_times, -rc, errno2str(-rc));
     }
 
     return rc;

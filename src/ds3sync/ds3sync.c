@@ -691,8 +691,90 @@ out:
     return rc;
 }
 
+static int ds3sync_sync_upload_entry(const char *entry)
+{
+    int rc = 0;
+    char *abspath = MFU_MALLOC(PATH_MAX);
+    char *key = MFU_MALLOC(PATH_MAX);
+    struct stat stat1, stat2;
+
+    if (entry[0] == '\0') {
+        snprintf(abspath, PATH_MAX, "%s", opts->local);
+        snprintf(key, PATH_MAX, "%s", opts->s3_prefix);
+    }
+    else {
+        snprintf(abspath, PATH_MAX, "%s/%s", opts->local, entry);
+        snprintf(key, PATH_MAX, "%s/%s", opts->s3_prefix, entry);
+    }
+
+    memset(&stat1, 0x00, sizeof(stat1));
+    rc = s3client_stat_path(s3client, key, &stat1);
+    if (rc && rc != -ENOENT) {
+        MFU_LOG(MFU_LOG_ERR, "failed to stat object 's3://%s/%s'. %d:%s",
+            opts->s3_bucket, key, -rc, errno2str(-rc));
+        goto out;
+    }
+
+    memset(&stat2, 0x00, sizeof(stat2));
+    rc = stat(abspath, &stat2);
+    if (rc) {
+        rc = -errno;
+        MFU_LOG(MFU_LOG_ERR, "failed to stat path '%s'. %d:%s",
+            abspath, -rc, errno2str(-rc));
+        goto out;
+    }
+    rc = 0;
+
+    if (stat1.st_mode == 0 ||
+        stat1.st_size != stat2.st_size ||
+        compare_timespec(&stat1.st_mtim, &stat2.st_mtim) < 0)
+    {
+        MFU_LOG(MFU_LOG_VERBOSE, "upload  : %s", entry);
+        rc = s3client_put_file(s3client, key, abspath);
+        if (rc) {
+            MFU_LOG(MFU_LOG_ERR, "upload fail: %s", entry);
+        }
+    }
+    else {
+        MFU_LOG(MFU_LOG_VERBOSE, "skip    : %s", entry);
+    }
+
+out:
+    mfu_free(&abspath);
+    mfu_free(&key);
+    return rc;
+}
+
 static void ds3sync_init_upload(CIRCLE_handle *handle)
 {
+    int rc = 0;
+    strmap *local_entries = strmap_new();
+    const strmap_node *node = NULL;
+    char *task = MFU_MALLOC(PATH_MAX + 2);
+
+    rc = posix_list_tree(opts->local, local_entries);
+    if (rc) {
+        MFU_LOG(MFU_LOG_ERR, "failed to list path '%s'. %d:%s",
+            opts->local, -rc, errno2str(-rc));
+        goto out;
+    }
+
+    if (strmap_size(local_entries) == 0) {
+        /* since we have tested the remote path, the key must be a single object */
+        strmap_set(local_entries, "", "");
+    }
+
+    strmap_foreach(local_entries, node) {
+        snprintf(task, PATH_MAX + 2, "U:%s", node->key);
+        MFU_LOG(MFU_LOG_DBG, "enqueue task '%s'", task);
+        handle->enqueue(task);
+    }
+
+out:
+    mfu_free(&task);
+    strmap_delete(&local_entries);
+    return;
+
 }
 
 static void ds3sync_add_root(CIRCLE_handle *handle)
@@ -723,6 +805,9 @@ static void ds3sync_process_entry(CIRCLE_handle *handle)
             break;
         case 'R':
             rc = ds3sync_sync_remove_entry(task + 2);
+            break;
+        case 'U':
+            rc = ds3sync_sync_upload_entry(task + 2);
             break;
         default:
             MFU_LOG(MFU_LOG_ERR, "unknown action '%c'", task[0]);

@@ -10,6 +10,7 @@ typedef struct {
     S3BucketContext bucketContent;
     int list_max_keys;
     int try_times;      // how many times to try if request fails for retryable reason
+    int put_times;      // how many times to put an object if it fails to be tested
 } s3client_t;
 
 extern const char *errno2str(int err);
@@ -28,6 +29,10 @@ extern int s3client_get_file(s3client_t *client, const char *key, const char *fn
 extern int s3client_list_tree(s3client_t *client, const char *prefix, strmap *entries);
 
 extern int s3client_stat_path(s3client_t *client, const char *key, struct stat *statbuf);
+
+extern int s3client_test_object(s3client_t *client, const char *key, const char *etag);
+
+extern int s3client_put_file(s3client_t *client, const char *key, const char *fn);
 
 #endif
 
