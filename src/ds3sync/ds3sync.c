@@ -12,6 +12,8 @@
 #include <getopt.h>
 #include <string.h>
 #include <libgen.h>
+#include <ftw.h>
+#include <pthread.h>
 
 #include "mpi.h"
 #include "libcircle.h"
@@ -24,6 +26,7 @@
 #define DS3SYNC_OPT_S3_ACCESS_KEY_ID        2
 #define DS3SYNC_OPT_S3_SECRET_ACCESS_KEY    3
 #define DS3SYNC_OPT_OVERWRITE               4
+#define DS3SYNC_OPT_DELETE                  5
 
 #define S3_ENDPOINT                         "S3_ENDPOINT"
 #define S3_ACCESS_KEY_ID                    "S3_ACCESS_KEY_ID"
@@ -48,6 +51,7 @@ typedef struct {
     char *s3_prefix;
 
     bool overwrite;
+    bool delete_extra;
 } ds3sync_opts_t;
 static ds3sync_opts_t *opts;
 
@@ -85,6 +89,7 @@ static void ds3sync_opts_dump(ds3sync_opts_t * opts)
     MFU_LOG(MFU_LOG_INFO, "  s3_bucket            = '%s'", opts->s3_bucket);
     MFU_LOG(MFU_LOG_INFO, "  s3_prefix            = '%s'", opts->s3_prefix);
     MFU_LOG(MFU_LOG_INFO, "  overwrite            = %s", opts->overwrite ? "true" : "false");
+    MFU_LOG(MFU_LOG_INFO, "  delete               = %s", opts->delete_extra ? "true" : "false");
 }
 
 static void print_usage(void)
@@ -143,6 +148,15 @@ static void print_usage(void)
 "    it will be renamed to the real file.\n"
 "\n";
     printf(str);
+
+    str = \
+"  --delete\n"
+"    If a file exists on TARGET but does not exist on SOURCE, delete it after\n"
+"    syncing.\n"
+"\n"
+"    The option is false by default.\n"
+"\n";
+    printf(str);
 }
 
 static bool is_s3_scheme(const char *str)
@@ -160,6 +174,7 @@ static int ds3sync_parse_args(int argc, char *argv[])
         {"s3-access-key-id", required_argument, 0, DS3SYNC_OPT_S3_ACCESS_KEY_ID},
         {"s3-secret-access-key", required_argument, 0, DS3SYNC_OPT_S3_SECRET_ACCESS_KEY},
         {"overwrite", no_argument, 0, DS3SYNC_OPT_OVERWRITE},
+        {"delete", no_argument, 0, DS3SYNC_OPT_DELETE},
         {0, 0, 0, 0}
     };
 
@@ -185,6 +200,9 @@ static int ds3sync_parse_args(int argc, char *argv[])
                 break;
             case DS3SYNC_OPT_OVERWRITE:
                 opts->overwrite = true;
+                break;
+            case DS3SYNC_OPT_DELETE:
+                opts->delete_extra = true;
                 break;
             default:
                 opts->help = true;
@@ -435,6 +453,67 @@ out:
     return rc;
 }
 
+pthread_mutex_t posix_list_tree_entries_lock = PTHREAD_MUTEX_INITIALIZER;
+static strmap *posix_list_tree_entries = NULL;
+static int posix_list_tree_prefix_len = 0;
+
+static int _posix_list_tree_callback(const char *fpath, const struct stat *sb,
+    int typeflag, struct FTW *ftwbuf)
+{
+    int rc = 0;
+
+    if (typeflag == FTW_F) {
+         strmap_set(posix_list_tree_entries, fpath + posix_list_tree_prefix_len, "");
+    }
+
+    return rc;
+}
+
+int posix_list_tree(const char *path, strmap *entries)
+{
+    int rc = -1;
+
+    pthread_mutex_lock(&posix_list_tree_entries_lock);
+    posix_list_tree_entries = entries;
+    posix_list_tree_prefix_len = strlen(path) + 1;
+
+    rc = nftw(path, _posix_list_tree_callback, 20, 0);
+    if (rc != 0) {
+        rc = -errno;
+    }
+
+    posix_list_tree_entries = NULL;
+    pthread_mutex_unlock(&posix_list_tree_entries_lock);
+    return rc;
+}
+
+static int _posix_remove_tree_callback(const char *fpath, const struct stat *sb,
+    int typeflag, struct FTW *ftwbuf)
+{
+    int rc = 0;
+
+    if (S_ISDIR(sb->st_mode)) {
+        rc = rmdir(fpath);
+    }
+    else {
+        rc = unlink(fpath);
+    }
+
+    return rc;
+}
+
+int posix_remove_tree(const char *path)
+{
+    int rc = -1;
+
+    rc = nftw(path, _posix_remove_tree_callback, 20, FTW_DEPTH);
+    if (rc != 0) {
+        rc = -errno;
+    }
+
+    return rc;
+}
+
 static int ds3sync_download_file(const char *key, const char *abspath)
 {
     int rc;
@@ -542,32 +621,74 @@ out:
 static void ds3sync_init_download(CIRCLE_handle *handle)
 {
     int rc = 0;
-    strmap *entries = strmap_new();
+    strmap *remote_entries = strmap_new();
+    strmap *local_entries = strmap_new();
     const strmap_node *node = NULL;
     char *task = MFU_MALLOC(PATH_MAX + 2);
 
-    rc = s3client_list_tree(s3client, opts->s3_prefix, entries);
+    rc = s3client_list_tree(s3client, opts->s3_prefix, remote_entries);
     if (rc) {
         MFU_LOG(MFU_LOG_ERR, "failed to list objects under '%s'. %d:%s",
             opts->remote, -rc, errno2str(-rc));
         goto out;
     }
 
-    if (strmap_size(entries) == 0) {
+    if (strmap_size(remote_entries) == 0) {
         /* since we have tested the remote path, the key must be a single object */
-        strmap_set(entries, "", "");
+        strmap_set(remote_entries, "", "");
+    }
+    if (opts->delete_extra) {
+        rc = posix_list_tree(opts->local, local_entries);
     }
 
-    strmap_foreach(entries, node) {
+    strmap_foreach(remote_entries, node) {
         snprintf(task, PATH_MAX + 2, "D:%s", node->key);
         MFU_LOG(MFU_LOG_DBG, "enqueue task '%s'", task);
         handle->enqueue(task);
+
+        if (opts->delete_extra) {
+            strmap_unset(local_entries, node->key);
+        }
+    }
+
+    if (opts->delete_extra) {
+        strmap_foreach(local_entries, node) {
+            snprintf(task, PATH_MAX + 2, "R:%s", node->key);
+            MFU_LOG(MFU_LOG_DBG, "enqueue task '%s'", task);
+            handle->enqueue(task);
+        }
+    }
+out:
+    mfu_free(&task);
+    strmap_delete(&remote_entries);
+    strmap_delete(&local_entries);
+    return;
+}
+
+static int ds3sync_sync_remove_entry(const char *path)
+{
+    int rc = 0;
+    char *abspath = MFU_MALLOC(PATH_MAX);
+
+    if (opts->opcode == DS3SYNC_OPCODE_DOWNLOAD) {
+        MFU_LOG(MFU_LOG_VERBOSE, "remove  : %s", path);
+        snprintf(abspath, PATH_MAX, "%s/%s", opts->local, path);
+        rc = posix_remove_tree(abspath);
+        if (rc && rc == -ENOENT) {
+            rc = 0;
+        }
+        if (rc) {
+            MFU_LOG(MFU_LOG_ERR, "remove fail: %s. %d:%s",
+                path, -rc, errno2str(-rc));
+        }
+    }
+    else {
+        rc = -ENOTSUP;
     }
 
 out:
-    mfu_free(&task);
-    strmap_delete(&entries);
-    return;
+    mfu_free(&abspath);
+    return rc;
 }
 
 static void ds3sync_init_upload(CIRCLE_handle *handle)
@@ -599,6 +720,9 @@ static void ds3sync_process_entry(CIRCLE_handle *handle)
     switch(task[0]) {
         case 'D':
             rc = ds3sync_sync_download_entry(task + 2);
+            break;
+        case 'R':
+            rc = ds3sync_sync_remove_entry(task + 2);
             break;
         default:
             MFU_LOG(MFU_LOG_ERR, "unknown action '%c'", task[0]);
