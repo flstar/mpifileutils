@@ -669,11 +669,24 @@ static int ds3sync_sync_remove_entry(const char *path)
 {
     int rc = 0;
     char *abspath = MFU_MALLOC(PATH_MAX);
+    char *key = MFU_MALLOC(PATH_MAX);
 
     if (opts->opcode == DS3SYNC_OPCODE_DOWNLOAD) {
         MFU_LOG(MFU_LOG_VERBOSE, "remove  : %s", path);
         snprintf(abspath, PATH_MAX, "%s/%s", opts->local, path);
         rc = posix_remove_tree(abspath);
+        if (rc && rc == -ENOENT) {
+            rc = 0;
+        }
+        if (rc) {
+            MFU_LOG(MFU_LOG_ERR, "remove fail: %s. %d:%s",
+                path, -rc, errno2str(-rc));
+        }
+    }
+    else if (opts->opcode == DS3SYNC_OPCODE_UPLOAD) {
+        MFU_LOG(MFU_LOG_VERBOSE, "remove  : %s", path);
+        snprintf(key, PATH_MAX, "%s/%s", opts->s3_prefix, path);
+        rc = s3client_delete_object(s3client, key);
         if (rc && rc == -ENOENT) {
             rc = 0;
         }
@@ -688,6 +701,7 @@ static int ds3sync_sync_remove_entry(const char *path)
 
 out:
     mfu_free(&abspath);
+    mfu_free(&key);
     return rc;
 }
 
@@ -749,6 +763,7 @@ static void ds3sync_init_upload(CIRCLE_handle *handle)
 {
     int rc = 0;
     strmap *local_entries = strmap_new();
+    strmap *remote_entries = strmap_new();
     const strmap_node *node = NULL;
     char *task = MFU_MALLOC(PATH_MAX + 2);
 
@@ -758,21 +773,41 @@ static void ds3sync_init_upload(CIRCLE_handle *handle)
             opts->local, -rc, errno2str(-rc));
         goto out;
     }
-
     if (strmap_size(local_entries) == 0) {
         /* since we have tested the remote path, the key must be a single object */
         strmap_set(local_entries, "", "");
+    }
+
+    if (opts->delete_extra) {
+        rc = s3client_list_tree(s3client, opts->s3_prefix, remote_entries);
+        if (rc) {
+            MFU_LOG(MFU_LOG_ERR, "failed to list s://%s/%s. %d:%s",
+                opts->s3_bucket, opts->s3_prefix, -rc, errno2str(-rc));
+            goto out;
+        }
     }
 
     strmap_foreach(local_entries, node) {
         snprintf(task, PATH_MAX + 2, "U:%s", node->key);
         MFU_LOG(MFU_LOG_DBG, "enqueue task '%s'", task);
         handle->enqueue(task);
+        if (opts->delete_extra) {
+            strmap_unset(remote_entries, node->key);
+        }
+    }
+
+    if (opts->delete_extra) {
+        strmap_foreach(remote_entries, node) {
+            snprintf(task, PATH_MAX + 2, "R:%s", node->key);
+            MFU_LOG(MFU_LOG_DBG, "enqueue task '%s'", task);
+            handle->enqueue(task);
+        }
     }
 
 out:
     mfu_free(&task);
     strmap_delete(&local_entries);
+    strmap_delete(&remote_entries);
     return;
 
 }

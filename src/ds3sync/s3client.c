@@ -606,3 +606,26 @@ int s3client_put_file(s3client_t *client, const char *key, const char *fn)
     return rc;
 }
 
+int s3client_delete_object(s3client_t * client, const char * key)
+{
+    int rc = 0;
+    common_callback_data_t cb_data;
+    memset(&cb_data, 0x00, sizeof(cb_data));
+    cb_data.status = -from_s3status(S3StatusInternalError);
+
+    RETRY_S3_REQUEST(
+        S3_delete_object(&client->bucketContent, key, NULL, 0, &default_response_handler, &cb_data),
+        client->try_times,
+        cb_data.status
+    );
+
+    if (cb_data.status == S3StatusOK && cb_data.status == S3StatusHttpErrorNotFound) {
+        rc = -ENOENT;
+    }
+    else {
+        rc = -from_s3status(cb_data.status);
+    }
+
+    return rc;
+}
+

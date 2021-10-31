@@ -34,5 +34,6 @@ extern int s3client_test_object(s3client_t *client, const char *key, const char 
 
 extern int s3client_put_file(s3client_t *client, const char *key, const char *fn);
 
+extern int s3client_delete_object(s3client_t * client, const char * key);
 #endif
 
