@@ -1,3 +1,10 @@
+/**
+ * @file ds3sync.c
+ *
+ * @author - Feng, Lei
+ *
+ *
+ */
 #ifndef _XOPEN_SOURCE
     #define _XOPEN_SOURCE 500
 #endif

@@ -1,3 +1,10 @@
+/**
+ * @file s3client.h
+ *
+ * @author - Feng, Lei
+ *
+ *
+ */
 #ifndef __S3CLIENT_H__
 #define __S3CLIENT_H__
 
