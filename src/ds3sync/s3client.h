@@ -13,6 +13,15 @@
 
 #include "strmap.h"
 
+#define DS3SYNC_MAX_MD_NUM	8
+
+#define DS3SYNC_MD_OWNER	"file-owner"
+#define DS3SYNC_MD_GROUP	"file-group"
+#define DS3SYNC_MD_MODE		"file-mode"
+#define DS3SYNC_MD_MTIME	"file-mtime"
+#define DS3SYNC_MD_ATIME	"file-atime"
+
+
 typedef struct {
     S3BucketContext bucketContent;
     int list_max_keys;
@@ -42,5 +51,6 @@ extern int s3client_test_object(s3client_t *client, const char *key, const char 
 extern int s3client_put_file(s3client_t *client, const char *key, const char *fn);
 
 extern int s3client_delete_object(s3client_t * client, const char * key);
+
 #endif
 

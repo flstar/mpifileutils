@@ -182,7 +182,7 @@ static S3Status default_response_properties_callback(
 
     if (cb_data->mds != NULL) {
         for (int i=0; i<properties->metaDataCount; i++) {
-            const S3NameValue *nv = properties->metaData;
+            const S3NameValue *nv = properties->metaData + i;
             strmap_set(cb_data->mds, nv->name, nv->value);
         }
     }
@@ -243,6 +243,91 @@ static ssize_t write_full(int fd, const void *vptr, size_t n)
     return(n);
 }
 
+static int stat_to_user_metadata(struct stat *statbuf, strmap *mds)
+{
+    int rc = 0;
+    char buff[64];
+
+    sprintf(buff, "%d", statbuf->st_uid);
+    strmap_set(mds, DS3SYNC_MD_OWNER, buff);
+    sprintf(buff, "%d", statbuf->st_gid);
+    strmap_set(mds, DS3SYNC_MD_GROUP, buff);
+    sprintf(buff, "0%o", statbuf->st_mode);
+    strmap_set(mds, DS3SYNC_MD_MODE, buff);
+    sprintf(buff, "%d.%09d", statbuf->st_mtim.tv_sec, statbuf->st_mtim.tv_nsec);
+    strmap_set(mds, DS3SYNC_MD_MTIME, buff);
+    sprintf(buff, "%d.%09d", statbuf->st_atim.tv_sec, statbuf->st_atim.tv_nsec);
+    strmap_set(mds, DS3SYNC_MD_ATIME, buff);
+
+    return 0;
+}
+
+static int user_metadata_to_stat(strmap *mds, struct stat *statbuf)
+{
+    int rc = 0;
+    const strmap_node *node = NULL;
+
+    strmap_foreach(mds, node) {
+        if (strcasecmp(DS3SYNC_MD_OWNER, node->key) == 0) {
+            rc = sscanf(node->value, "%d", &statbuf->st_uid);
+        }
+        else if (strcasecmp(DS3SYNC_MD_GROUP, node->key) == 0) {
+            rc = sscanf(node->value, "%d", &statbuf->st_gid);
+        }
+        else if (strcasecmp(DS3SYNC_MD_MODE, node->key) == 0) {
+            rc = sscanf(node->value, "0%o", &statbuf->st_mode);
+        }
+        else if (strcasecmp(DS3SYNC_MD_MTIME, node->key) == 0) {
+            rc = sscanf(node->value, "%d.%d", &statbuf->st_mtim.tv_sec, &statbuf->st_mtim.tv_nsec);
+        }
+        else if (strcasecmp(DS3SYNC_MD_ATIME, node->key) == 0) {
+            rc = sscanf(node->value, "%d.%d", &statbuf->st_atim.tv_sec, &statbuf->st_atim.tv_nsec);
+        }
+
+        if (rc <= 0) {
+            MFU_LOG(MFU_LOG_WARN, "unrecognized format of user-metadata %s=%s",
+                node->key, node->value);
+        }
+    }
+
+    return 0;
+}
+
+static int restore_stat(const char *fn, struct stat *statbuf)
+{
+    int rc = 0;
+
+    /* restore permission */
+    mode_t perm = statbuf->st_mode & (S_IRWXU | S_IRWXG | S_IRWXO);
+    rc = chmod(fn, perm);
+    if (rc) {
+        rc = -errno;
+        MFU_LOG(MFU_LOG_ERR, "failed to set permission to 0%o for file '%s'. %d:%s",
+            perm, fn, -rc, errno2str(-rc));
+        goto out;
+    }
+    /* restore mtime based object's mtime */
+    struct timespec times[] = {statbuf->st_atim, statbuf->st_mtim};
+    rc = utimensat(AT_FDCWD, fn, times, 0);
+    if (rc) {
+        rc = -errno;
+        MFU_LOG(MFU_LOG_ERR, "failed to update atime/mtime for file '%s'. %d:%s",
+            fn, -rc, errno2str(-rc));
+        goto out;
+    }
+    /* restore uid and gid */
+    rc = chown(fn, statbuf->st_uid, statbuf->st_gid);
+    if (rc) {
+        rc = -errno;
+        MFU_LOG(MFU_LOG_ERR, "failed to set uid:gid to %d:%d for file '%s'. %d.%s",
+            statbuf->st_uid, statbuf->st_gid, fn, -rc, errno2str(-rc));
+        goto out;
+    }
+
+out:
+    return rc;
+}
+
 typedef struct {
     common_callback_data_t common;
     int fd;
@@ -266,6 +351,7 @@ int s3client_get_file(s3client_t *client, const char *key, const char *fn)
     int rc = -from_s3status(S3StatusInternalError);
     int fd = -1;
     get_file_callback_data_t cb_data;
+    struct stat stat1;
 
     memset(&cb_data, 0x00, sizeof(cb_data));
     cb_data.common.mds = strmap_new();
@@ -299,8 +385,18 @@ int s3client_get_file(s3client_t *client, const char *key, const char *fn)
         goto out;
     }
 
+    /* restore stat */
+    memset(&stat1, 0x00, sizeof(stat1));
+    stat1.st_size = cb_data.common.length;
+    stat1.st_uid = getuid();
+    stat1.st_gid = getgid();
+    stat1.st_mtim.tv_sec = cb_data.common.mtime;
+    stat1.st_atim.tv_nsec = UTIME_OMIT;
+
+    user_metadata_to_stat(cb_data.common.mds, &stat1);
+
     /* truncate file to exactly the length of object */
-    rc = ftruncate(fd, cb_data.common.length);
+    rc = ftruncate(fd, stat1.st_size);
     if (rc) {
         rc = -errno;
         MFU_LOG(MFU_LOG_ERR, "failed to truncate file '%s' to length %llu. %d:%s",
@@ -308,12 +404,12 @@ int s3client_get_file(s3client_t *client, const char *key, const char *fn)
         goto out;
     }
 
-    /* restore mtime based object's mtime */
-    struct timespec times[] = { {0, UTIME_OMIT}, {cb_data.common.mtime, 0} };
-    rc = futimens(fd, times);
+    close(fd);
+    fd = -1;
+
+    rc = restore_stat(fn, &stat1);
     if (rc) {
-        rc = -errno;
-        MFU_LOG(MFU_LOG_ERR, "failed to update mtime/atime. %d:%s",
+        MFU_LOG(MFU_LOG_ERR, "failed to restore file stat. %d:%s",
             -rc, errno2str(-rc));
         goto out;
     }
@@ -399,8 +495,10 @@ int s3client_stat_path(s3client_t *client, const char *key, struct stat *statbuf
 {
     int rc = 0;
     common_callback_data_t cb_data;
+
     memset(&cb_data, 0x00, sizeof(cb_data));
     cb_data.status = S3StatusInternalError;
+    cb_data.mds = strmap_new();
 
     RETRY_S3_REQUEST(
         S3_head_object(&client->bucketContent, key, NULL, 0, &default_response_handler, &cb_data),
@@ -410,9 +508,12 @@ int s3client_stat_path(s3client_t *client, const char *key, struct stat *statbuf
 
     if (cb_data.status == S3StatusOK) {
         statbuf->st_mode = S_IFREG;
+        statbuf->st_size = cb_data.length;
         statbuf->st_mtim.tv_sec = cb_data.mtime;
         statbuf->st_mtim.tv_nsec = 0;
-        statbuf->st_size = cb_data.length;
+        statbuf->st_atim.tv_nsec = UTIME_OMIT;
+        user_metadata_to_stat(cb_data.mds, statbuf);
+
         rc = 0;
     }
     else if (cb_data.status == S3StatusHttpErrorNotFound ||
@@ -438,6 +539,7 @@ int s3client_stat_path(s3client_t *client, const char *key, struct stat *statbuf
         rc = -from_s3status(cb_data.status);
     }
 
+    strmap_delete(&cb_data.mds);
     return rc;
 }
 
@@ -513,15 +615,18 @@ static int _put_file_callback(int bufferSize, char *buffer, void *callbackData)
 static int s3client_put_file_once(s3client_t *client, const char *key, const char *fn)
 {
     int rc = -from_s3status(S3StatusInternalError);
-    int fd = -1;
+    int fd = -1, i, md_num;
     put_file_callback_data_t cb_data;
     unsigned char md5[MD5_DIGEST_LENGTH];
     char b64md5[2 * MD5_DIGEST_LENGTH];
     char etag[MAX_ETAG_SIZE];
     struct stat stat1;
+    S3NameValue nvs[DS3SYNC_MAX_MD_NUM];
+    const strmap_node *node = NULL;
 
     memset(&cb_data, 0x00, sizeof(cb_data));
     cb_data.common.status = S3StatusInternalError;
+    cb_data.common.mds = strmap_new();
 
     // open local file
     fd = open(fn, O_RDONLY | O_NOATIME);
@@ -540,7 +645,7 @@ static int s3client_put_file_once(s3client_t *client, const char *key, const cha
     EVP_EncodeBlock(b64md5, md5, MD5_DIGEST_LENGTH);
 
     etag[0] = '"';
-    for (int i = 0; i < MD5_DIGEST_LENGTH; i++) {
+    for (i = 0; i < MD5_DIGEST_LENGTH; i++) {
         sprintf(etag + 2 * i + 1, "%02x", (unsigned char)md5[i]);
     }
     etag[2 * MD5_DIGEST_LENGTH + 1] = '"';
@@ -553,12 +658,21 @@ static int s3client_put_file_once(s3client_t *client, const char *key, const cha
         goto out;
     }
 
+    stat_to_user_metadata(&stat1, cb_data.common.mds);
+
+    md_num = 0;
+    strmap_foreach(cb_data.common.mds, node) {
+        nvs[md_num].name = node->key;
+        nvs[md_num].value = node->value;
+        md_num++;
+    }
+
     S3PutObjectHandler handler = {
         default_response_handler,
         &_put_file_callback
     };
 
-    S3PutProperties props = {NULL, b64md5, NULL, NULL, NULL, -1, 0, 0, NULL, 0};
+    S3PutProperties props = {NULL, b64md5, NULL, NULL, NULL, -1, 0, md_num, nvs, 0};
 
     RETRY_S3_REQUEST(
         do {
@@ -585,6 +699,7 @@ out:
     if (fd >= 0) {
         close(fd);
     }
+    strmap_delete(&cb_data.common.mds);
     return rc;
 }
 
