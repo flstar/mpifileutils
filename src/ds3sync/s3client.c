@@ -32,9 +32,6 @@
 
 #define MAX_ETAG_SIZE      40
 
-#define DS3SYNC_STAT_MD_NAME     "ds3sync-stat"
-
-
 
 static pthread_mutex_t libs3_init_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int libs3_init_count             = 0;
@@ -140,7 +137,7 @@ s3client_t * s3client_new(
 
     client->list_max_keys = 1000;
     client->try_times = 3;
-    client->put_times = 3;
+    client->put_times = 2;
 
 out:
     return client;
@@ -207,17 +204,14 @@ static S3ResponseHandler default_response_handler = {
 };
 
 #define RETRY_S3_REQUEST(action, times, status) do { \
-    for (int i = 0; i < times; i++) { \
+    for (int i = 1; i <= times; i++) { \
         action; \
-        if (!S3_status_is_retryable(status)) { \
+        if (!S3_status_is_retryable(status)) \
             break; \
-        } \
-        if (S3_status_is_retryable(status)) { \
-            int rc = from_s3status(status); \
-            MFU_LOG(MFU_LOG_VERBOSE, \
+        int rc = from_s3status(status); \
+        MFU_LOG(MFU_LOG_VERBOSE, \
                 "S3 request failed for retryable reason after trying for %d times. %d:%s\n", \
-                times, rc, errno2str(rc) ); \
-        } \
+                i, rc, errno2str(rc) ); \
     } \
 } while (0)
 
@@ -707,13 +701,13 @@ int s3client_put_file(s3client_t *client, const char *key, const char *fn)
 {
     int rc = -from_s3status(S3StatusInternalError);
 
-    for (int i = 0; i < client->put_times; i++) {
+    for (int i = 1; i <= client->put_times; i++) {
         rc = s3client_put_file_once(client, key, fn);
-        if (rc && (-rc) >= S3STATUS_BASE && i < client->put_times - 1) {
-            int secs = 10 * (i + 1);
+        if (rc && (-rc) >= S3STATUS_BASE && i < client->put_times) {
+            int secs = 10;
             MFU_LOG(MFU_LOG_VERBOSE, "failed to put object %s, %d:%s. Retry in %d seconds.",
                 key, -rc, errno2str(-rc), secs);
-            sleep(secs);       // 10, 20, totally 30 seconds
+            sleep(secs);
         }
         else {
             break;
@@ -733,7 +727,7 @@ int s3client_delete_object(s3client_t * client, const char * key)
     int rc = 0;
     common_callback_data_t cb_data;
     memset(&cb_data, 0x00, sizeof(cb_data));
-    cb_data.status = -from_s3status(S3StatusInternalError);
+    cb_data.status = S3StatusInternalError;
 
     RETRY_S3_REQUEST(
         S3_delete_object(&client->bucketContent, key, NULL, 0, &default_response_handler, &cb_data),
@@ -741,7 +735,7 @@ int s3client_delete_object(s3client_t * client, const char * key)
         cb_data.status
     );
 
-    if (cb_data.status == S3StatusOK && cb_data.status == S3StatusHttpErrorNotFound) {
+    if (cb_data.status == S3StatusHttpErrorNotFound) {
         rc = -ENOENT;
     }
     else {
